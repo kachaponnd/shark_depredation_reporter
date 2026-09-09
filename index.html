@@ -1033,10 +1033,18 @@
   }
 
   /* ---------------- tessellation GRID_ID matching (hidden reference) ----------------
-     A compact index of the tessellation's actual hexagon geometry (GRID_ID + ring) is
-     loaded once and cached, so each report can be tagged with the exact GRID_ID cells its
-     points and polygons fall in — without ever drawing the grid. A point → the cell that
-     truly contains it; a polygon → every cell the drawn area actually overlaps. */
+     GRID_IDs are calculated without drawing the full hex grid.
+
+     Preferred path:
+       1) use the small local/cached cell index when it is available;
+       2) if that index is missing, query the ArcGIS FeatureServer directly for only
+          the point/polygon being submitted.
+
+     This prevents blank GRID_IDs when Tesellas_shark_NH_cells.json is not present,
+     while keeping the optional local index for offline/fast matching.
+
+     The legacy HEX_ID/hexId calculation is also retained separately so it can be
+     switched back into the reporting workflow later if needed. */
   const GRID_INDEX_URL = 'Tesellas_shark_NH_cells.json';
   const GRID_INDEX_KEY = 'sde:gridcells';
   let gcId = null;                 // Array<string> of GRID_IDs
@@ -1140,6 +1148,105 @@
     };
     walk(geom);
     return Array.from(out);
+  }
+
+
+  // Query ArcGIS only for the submitted geometry.
+  // This is the fallback that makes GRID_ID reporting work even when the optional
+  // Tesellas_shark_NH_cells.json file is not in the GitHub repository.
+  async function queryGridIdsOnline(geom){
+    if(!geom) return [];
+
+    const out = new Set();
+
+    async function queryOne(geometry, geometryType){
+      const params = new URLSearchParams({
+        where:'1=1',
+        geometry:JSON.stringify(geometry),
+        geometryType,
+        inSR:'4326',
+        spatialRel:'esriSpatialRelIntersects',
+        outFields:'GRID_ID',
+        returnGeometry:'false',
+        f:'json',
+        resultRecordCount:'2000'
+      });
+
+      const res = await fetch(HEX_SERVICE+'?'+params.toString());
+      if(!res.ok) throw new Error('GRID_ID lookup HTTP '+res.status);
+
+      const data = await res.json();
+      if(data.error) throw new Error(data.error.message || 'GRID_ID lookup failed');
+
+      for(const f of (data.features||[])){
+        const a = f.attributes || {};
+        if(a.GRID_ID != null && a.GRID_ID !== '') out.add(String(a.GRID_ID));
+      }
+    }
+
+    async function walk(g){
+      if(!g) return;
+
+      if(g.type==='Point'){
+        await queryOne(
+          {x:g.coordinates[0], y:g.coordinates[1], spatialReference:{wkid:4326}},
+          'esriGeometryPoint'
+        );
+      }
+      else if(g.type==='MultiPoint'){
+        for(const c of g.coordinates){
+          await queryOne(
+            {x:c[0], y:c[1], spatialReference:{wkid:4326}},
+            'esriGeometryPoint'
+          );
+        }
+      }
+      else if(g.type==='Polygon'){
+        await queryOne(
+          {rings:g.coordinates, spatialReference:{wkid:4326}},
+          'esriGeometryPolygon'
+        );
+      }
+      else if(g.type==='MultiPolygon'){
+        for(const poly of g.coordinates){
+          await queryOne(
+            {rings:poly, spatialReference:{wkid:4326}},
+            'esriGeometryPolygon'
+          );
+        }
+      }
+      else if(g.type==='GeometryCollection'){
+        for(const child of (g.geometries||[])) await walk(child);
+      }
+    }
+
+    await walk(geom);
+    return Array.from(out);
+  }
+
+  // Resolve GRID_IDs using the lightweight local index when possible,
+  // otherwise query the ArcGIS service directly.
+  // Returns null only when lookup could not be completed (for example, offline
+  // before the local index has ever been cached). An empty array means the
+  // lookup succeeded but the geometry did not intersect a study cell.
+  async function resolveGridIds(geom){
+    if(!geom) return [];
+
+    if(!gcReady){
+      try{ await loadGridIndex(); }catch(e){}
+    }
+
+    if(gcReady){
+      const local = computeGridIds(geom);
+      if(Array.isArray(local)) return local;
+    }
+
+    try{
+      return await queryGridIdsOnline(geom);
+    }catch(err){
+      console.warn('GRID_ID lookup unavailable:', err);
+      return null;
+    }
   }
 
 
@@ -1771,7 +1878,10 @@
     return {
       id:e.id, participant_id:e.participantId||'', datetime:e.datetime||'', created_at:e.createdAt||'',
       geom_type:e.geomType||'',
+      // grid_ids is the active reporting field.
       grid_ids:(e.gridIds||[]).join(';'), grid_id_count:(e.gridIds||[]).length,
+      // Keep legacy hex_id available in the payload for an easy future switch-back.
+      hex_id:e.hexId||'',
       latitude:e.center?e.center[0]:'', longitude:e.center?e.center[1]:'',
       shark_species:displayShark(e), target_species:displayTarget(e),
       outcome:e.outcome||'', fish_depredated:e.numLost||'', gear:e.gear||'', depth_ft:e.depth||'',
@@ -1781,11 +1891,34 @@
   }
   async function syncEntry(e){
     if(!SUBMIT_ENDPOINT) return false;
-    // Fill in GRID_IDs if they couldn't be computed at save time (index not yet loaded / logged offline).
-    if((!e.gridIds || !e.gridIds.length) && e.geometry){
-      if(!gcReady) { try{ await loadGridIndex(); }catch(x){} }
-      const g=computeGridIds(e.geometry); if(g && g.length){ e.gridIds=g; try{ await S.set(e.id,e); }catch(x){} }
+
+    // ACTIVE FIELD: GRID_IDs.
+    // If they were not available when the event was first saved, resolve them now.
+    // The ArcGIS online fallback means the separate cells.json file is no longer required.
+    if((!Array.isArray(e.gridIds) || !e.gridIds.length) && e.geometry){
+      const g = await resolveGridIds(e.geometry);
+
+      // null means the lookup could not be completed. Keep the report pending rather
+      // than marking it "Synced" with a permanently blank GRID_ID field.
+      if(g === null) return false;
+
+      e.gridIds = g;
+      try{ await S.set(e.id,e); }catch(x){}
     }
+
+    // BACKUP / LEGACY FIELD: HEX_ID.
+    // Keep calculating one representative hex (the containing/nearest cell at the
+    // report center) even though the current Google Sheet uses grid_ids instead.
+    if(!e.hexId && e.center && e.center.length>=2){
+      try{
+        const h = await hexAt(e.center[0], e.center[1]);
+        if(h && h.id){
+          e.hexId = h.id;
+          try{ await S.set(e.id,e); }catch(x){}
+        }
+      }catch(x){}
+    }
+
     // plain-text body keeps this a "simple" CORS request (no preflight)
     const res=await fetch(SUBMIT_ENDPOINT,{ method:'POST', body:JSON.stringify(toPayload(e)) });
     let ok=false; try{ const j=await res.json(); ok=!!(j&&j.ok); }catch(err){ ok=res.ok; }
